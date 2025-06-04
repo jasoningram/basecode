@@ -1,43 +1,38 @@
 from pyspark.sql import Window
-from pyspark.sql.functions import col, sum as _sum, lit, when
-import numpy as np
+from pyspark.sql.functions import col, sum as _sum, lit, min as _min, expr
 
 def weighted_quartiles_by_category(df, catt, numvar, wt):
-    # Normalize weights per group
-    window_cat = Window.partitionBy(catt)
-    df = df.withColumn("group_weight_sum", _sum(wt).over(window_cat))
-    df = df.withColumn("normalized_wt", col(wt) / col("group_weight_sum"))
+    # Total weight per category
+    total_weight = df.groupBy(catt).agg(_sum(wt).alias("total_wt"))
+    df = df.join(total_weight, on=catt)
 
-    # Sort within group
-    window_ordered = Window.partitionBy(catt).orderBy(col(numvar))
-    df = df.withColumn("cum_wt", _sum("normalized_wt").over(window_ordered))
+    # Normalize weight
+    df = df.withColumn("norm_wt", col(wt) / col("total_wt"))
 
-    # Define the target quantiles
-    quantiles = [0.25, 0.5, 0.75]
+    # Cumulative weight ordered by numvar
+    w = Window.partitionBy(catt).orderBy(numvar).rowsBetween(Window.unboundedPreceding, 0)
+    df = df.withColumn("cum_wt", _sum("norm_wt").over(w))
 
-    # Collect data for interpolation
-    pdf = df.select(catt, numvar, "cum_wt").toPandas()
+    # Define thresholds
+    thresholds = [0.25, 0.5, 0.75]
 
-    # Compute weighted quantiles per category
-    results = []
-    for category, group in pdf.groupby(catt):
-        group = group.sort_values(numvar).reset_index(drop=True)
-        cum_weights = group["cum_wt"].values
-        values = group[numvar].values
-        for q in quantiles:
-            idx = np.searchsorted(cum_weights, q, side="right")
-            if idx == 0:
-                quantile_val = values[0]
-            elif idx == len(values):
-                quantile_val = values[-1]
-            else:
-                # Linear interpolation
-                w1, w2 = cum_weights[idx - 1], cum_weights[idx]
-                v1, v2 = values[idx - 1], values[idx]
-                quantile_val = v1 + (q - w1) * (v2 - v1) / (w2 - w1)
-            results.append((category, q, quantile_val))
+    # Initialize empty union DataFrame
+    result_df = None
+    for q in thresholds:
+        # For each category, find the smallest numvar where cum_wt >= quantile
+        q_df = (
+            df
+            .where(col("cum_wt") >= lit(q))
+            .groupBy(catt)
+            .agg(_min(numvar).alias("value"))
+            .withColumn("quantile", lit(q))
+        )
 
-    # Convert to Spark DataFrame
-    spark = df.sql_ctx.sparkSession
-    result_df = spark.createDataFrame(results, [catt, "quantile", "value"])
-    return result_df
+        # Union results
+        if result_df is None:
+            result_df = q_df
+        else:
+            result_df = result_df.union(q_df)
+
+    return result_df.select(catt, "quantile", "value")
+
